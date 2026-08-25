@@ -1,0 +1,255 @@
+using AutoMapper;
+using FridgeWatch.Application.DTOs;
+using FridgeWatch.Application.Interfaces;
+using FridgeWatch.Domain.Entities;
+using FridgeWatch.Domain.Enums;
+using FridgeWatch.Domain.Interfaces;
+using FridgeWatch.Domain.Common;
+
+namespace FridgeWatch.Application.Services;
+
+public class ConsumptionRecordService : IConsumptionRecordService
+{
+    private readonly IUnitOfWork _unitOfWork;
+    private readonly IMapper _mapper;
+    private readonly IAuditLogService _auditLogService;
+
+    public ConsumptionRecordService(IUnitOfWork unitOfWork, IMapper mapper, IAuditLogService auditLogService)
+    {
+        _unitOfWork = unitOfWork;
+        _mapper = mapper;
+        _auditLogService = auditLogService;
+    }
+
+    public async Task<PagedResultDto<ConsumptionRecordDto>> GetListAsync(
+        QueryParametersDto parameters,
+        int? foodItemId = null,
+        int? householdId = null,
+        int? userId = null)
+    {
+        var queryParams = _mapper.Map<QueryParameters>(parameters);
+
+        var resolvedHouseholdId = await ResolveHouseholdIdAsync(householdId, userId);
+
+        PagedResult<ConsumptionRecord> result;
+        if (foodItemId.HasValue)
+        {
+            result = await _unitOfWork.ConsumptionRecords.GetByFoodItemIdAsync(foodItemId.Value, queryParams);
+        }
+        else if (resolvedHouseholdId.HasValue)
+        {
+            result = await _unitOfWork.ConsumptionRecords.GetByHouseholdIdAsync(resolvedHouseholdId.Value, queryParams);
+        }
+        else
+        {
+            result = await _unitOfWork.ConsumptionRecords.GetPagedAsync(queryParams);
+        }
+
+        return _mapper.Map<PagedResultDto<ConsumptionRecordDto>>(result);
+    }
+
+    private async Task<int?> ResolveHouseholdIdAsync(int? householdId, int? userId)
+    {
+        if (householdId.HasValue)
+        {
+            return householdId.Value;
+        }
+
+        if (userId.HasValue)
+        {
+            var user = await _unitOfWork.Users.GetByIdAsync(userId.Value);
+            if (user != null && user.DefaultHouseholdId.HasValue)
+            {
+                return user.DefaultHouseholdId.Value;
+            }
+        }
+
+        return null;
+    }
+
+    public async Task<PagedResultDto<ConsumptionRecordDto>> GetMineAsync(int userId, QueryParametersDto parameters)
+    {
+        var queryParams = _mapper.Map<QueryParameters>(parameters);
+        var result = await _unitOfWork.ConsumptionRecords.GetByUserIdAsync(userId, queryParams);
+        return _mapper.Map<PagedResultDto<ConsumptionRecordDto>>(result);
+    }
+
+    public async Task<ConsumptionRecordDto> GetByIdAsync(int id)
+    {
+        var record = await _unitOfWork.ConsumptionRecords.GetByIdAsync(id);
+        if (record == null)
+        {
+            throw new BusinessException("消耗记录不存在");
+        }
+
+        return _mapper.Map<ConsumptionRecordDto>(record);
+    }
+
+    public async Task<ConsumptionRecordDto> CreateAsync(ConsumptionRecordCreateDto dto, int userId)
+    {
+        var foodItem = await _unitOfWork.FoodItems.GetByIdAsync(dto.FoodItemId);
+        if (foodItem == null)
+        {
+            throw new BusinessException("食材不存在");
+        }
+
+        if (!await _unitOfWork.HouseholdMembers.IsHouseholdMemberAsync(foodItem.HouseholdId, userId))
+        {
+            throw new UnauthorizedAccessException("您不是该家庭的成员");
+        }
+
+        if (dto.ConsumedQuantity > foodItem.Quantity)
+        {
+            throw new BusinessException("消耗数量不能大于剩余数量");
+        }
+
+        var record = _mapper.Map<ConsumptionRecord>(dto);
+        record.UserId = userId;
+        record.ConsumedAt = dto.ConsumedAt ?? DateTime.UtcNow;
+
+        await _unitOfWork.BeginTransactionAsync();
+        try
+        {
+            await _unitOfWork.ConsumptionRecords.AddAsync(record);
+
+            foodItem.Quantity -= dto.ConsumedQuantity;
+            if (foodItem.Quantity < 0)
+            {
+                foodItem.Quantity = 0;
+            }
+            foodItem.Status = FoodStatusHelper.CalculateStatus(foodItem.ExpiryDate, foodItem.Quantity);
+            foodItem.UpdatedAt = DateTime.UtcNow;
+            await _unitOfWork.FoodItems.UpdateAsync(foodItem);
+
+            await _unitOfWork.SaveChangesAsync();
+            await _unitOfWork.CommitTransactionAsync();
+        }
+        catch
+        {
+            await _unitOfWork.RollbackTransactionAsync();
+            throw;
+        }
+
+        var operatorName = (await _unitOfWork.Users.GetByIdAsync(userId))?.Username ?? userId.ToString();
+        var householdId = foodItem.HouseholdId;
+        await _auditLogService.LogAsync("ConsumptionRecord", record.Id, "Create", userId, operatorName, householdId, $"记录消耗食材「{foodItem.Name}」{dto.ConsumedQuantity}{foodItem.Unit}");
+
+        return _mapper.Map<ConsumptionRecordDto>(record);
+    }
+
+    public async Task<ConsumptionRecordDto> UpdateAsync(int id, ConsumptionRecordUpdateDto dto, int userId)
+    {
+        var record = await _unitOfWork.ConsumptionRecords.GetByIdAsync(id);
+        if (record == null)
+        {
+            throw new BusinessException("消耗记录不存在");
+        }
+
+        if (record.UserId != userId)
+        {
+            throw new UnauthorizedAccessException("只能修改自己的消耗记录");
+        }
+
+        var foodItem = await _unitOfWork.FoodItems.GetByIdAsync(record.FoodItemId);
+        if (foodItem == null)
+        {
+            throw new BusinessException("对应食材不存在");
+        }
+
+        var oldConsumedQuantity = record.ConsumedQuantity;
+        var quantityChanged = dto.ConsumedQuantity.HasValue && dto.ConsumedQuantity.Value != oldConsumedQuantity;
+
+        if (quantityChanged)
+        {
+            var quantityDiff = dto.ConsumedQuantity!.Value - oldConsumedQuantity;
+            if (quantityDiff > foodItem.Quantity)
+            {
+                throw new BusinessException("消耗数量不能大于剩余数量");
+            }
+        }
+
+        _mapper.Map(dto, record);
+
+        await _unitOfWork.BeginTransactionAsync();
+        try
+        {
+            if (quantityChanged)
+            {
+                var quantityDiff = dto.ConsumedQuantity!.Value - oldConsumedQuantity;
+                foodItem.Quantity -= quantityDiff;
+                if (foodItem.Quantity < 0)
+                {
+                    foodItem.Quantity = 0;
+                }
+                foodItem.Status = FoodStatusHelper.CalculateStatus(foodItem.ExpiryDate, foodItem.Quantity);
+                foodItem.UpdatedAt = DateTime.UtcNow;
+                await _unitOfWork.FoodItems.UpdateAsync(foodItem);
+            }
+
+            await _unitOfWork.ConsumptionRecords.UpdateAsync(record);
+            await _unitOfWork.SaveChangesAsync();
+            await _unitOfWork.CommitTransactionAsync();
+        }
+        catch
+        {
+            await _unitOfWork.RollbackTransactionAsync();
+            throw;
+        }
+
+        var operatorName = (await _unitOfWork.Users.GetByIdAsync(userId))?.Username ?? userId.ToString();
+        string logDetail;
+        if (quantityChanged)
+        {
+            logDetail = $"修改消耗记录（食材：{foodItem.Name}，消耗数量从 {oldConsumedQuantity}{foodItem.Unit} 改为 {record.ConsumedQuantity}{foodItem.Unit}）";
+        }
+        else
+        {
+            logDetail = $"修改消耗记录（食材：{foodItem.Name}）";
+        }
+        await _auditLogService.LogAsync("ConsumptionRecord", record.Id, "Update", userId, operatorName, foodItem.HouseholdId, logDetail);
+
+        return _mapper.Map<ConsumptionRecordDto>(record);
+    }
+
+    public async Task DeleteAsync(int id, int userId)
+    {
+        var record = await _unitOfWork.ConsumptionRecords.GetByIdAsync(id);
+        if (record == null)
+        {
+            throw new BusinessException("消耗记录不存在");
+        }
+
+        if (record.UserId != userId)
+        {
+            throw new UnauthorizedAccessException("只能删除自己的消耗记录");
+        }
+
+        var foodItem = await _unitOfWork.FoodItems.GetByIdAsync(record.FoodItemId);
+        if (foodItem == null)
+        {
+            throw new BusinessException("对应食材不存在");
+        }
+
+        await _unitOfWork.BeginTransactionAsync();
+        try
+        {
+            await _unitOfWork.ConsumptionRecords.DeleteAsync(id);
+
+            foodItem.Quantity += record.ConsumedQuantity;
+            foodItem.Status = FoodStatusHelper.CalculateStatus(foodItem.ExpiryDate, foodItem.Quantity);
+            foodItem.UpdatedAt = DateTime.UtcNow;
+            await _unitOfWork.FoodItems.UpdateAsync(foodItem);
+
+            await _unitOfWork.SaveChangesAsync();
+            await _unitOfWork.CommitTransactionAsync();
+        }
+        catch
+        {
+            await _unitOfWork.RollbackTransactionAsync();
+            throw;
+        }
+
+        var operatorName = (await _unitOfWork.Users.GetByIdAsync(userId))?.Username ?? userId.ToString();
+        await _auditLogService.LogAsync("ConsumptionRecord", id, "Delete", userId, operatorName, foodItem.HouseholdId, $"删除消耗记录（食材：{foodItem.Name}，消耗 {record.ConsumedQuantity}{foodItem.Unit}）");
+    }
+}

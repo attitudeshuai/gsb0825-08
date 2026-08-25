@@ -1,0 +1,35 @@
+using FluentValidation;
+using FridgeWatch.Application.DTOs;
+
+namespace FridgeWatch.Application.Validators;
+
+public class HouseholdCreateDtoValidator : AbstractValidator<HouseholdCreateDto>
+{
+    public HouseholdCreateDtoValidator()
+    {
+        RuleFor(x => x.Name)
+            .NotEmpty().WithMessage("家庭名称不能为空")
+            .Length(2, 100).WithMessage("家庭名称长度必须在2-100个字符之间");
+    }
+}
+
+public class HouseholdUpdateDtoValidator : AbstractValidator<HouseholdUpdateDto>
+{
+    public HouseholdUpdateDtoValidator()
+    {
+        RuleFor(x => x.Name)
+            .Length(2, 100).WithMessage("家庭名称长度必须在2-100个字符之间")
+            .When(x => !string.IsNullOrEmpty(x.Name));
+    }
+}
+
+public class ResetInviteCodeDtoValidator : AbstractValidator<ResetInviteCodeDto>
+{
+    public ResetInviteCodeDtoValidator()
+    {
+        RuleFor(x => x.ValidDays)
+            .GreaterThan(0).WithMessage("有效天数必须大于0")
+            .LessThanOrEqualTo(365).WithMessage("有效天数不能超过365天")
+            .When(x => x.ValidDays.HasValue);
+    }
+}
