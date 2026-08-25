@@ -2,13 +2,16 @@ using Xunit;
 using FluentAssertions;
 using Moq;
 using AutoMapper;
+using Microsoft.Extensions.Logging;
 using FridgeWatch.Application.Services;
 using FridgeWatch.Application.Interfaces;
+using FridgeWatch.Domain.Common;
 using FridgeWatch.Domain.Entities;
 using FridgeWatch.Domain.Interfaces;
 using FridgeWatch.Domain.Enums;
 using FridgeWatch.Application.DTOs;
 using FridgeWatch.Application.Mappings;
+using System.Linq.Expressions;
 
 namespace FridgeWatch.Tests;
 
@@ -434,5 +437,408 @@ public class CsvParserTests
         result[2][0].Should().Be("大米");
         result[3][0].Should().Be("特级\n鸡胸肉");
         result[4][0].Should().Be("3\" 装鸡蛋");
+    }
+}
+
+public class FoodStatusHelperTests
+{
+    [Theory]
+    [InlineData(-30)]
+    [InlineData(-2)]
+    [InlineData(-1)]
+    public void CalculateStatus_WhenAlreadyExpired_ReturnsExpired(int daysToExpiry)
+    {
+        // Arrange
+        var expiryDate = DateTime.UtcNow.Date.AddDays(daysToExpiry);
+
+        // Act
+        var result = FoodStatusHelper.CalculateStatus(expiryDate);
+
+        // Assert
+        result.Should().Be(FoodStatus.Expired);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    public void CalculateStatus_WhenWithinThreeDays_ReturnsNearExpiry(int daysToExpiry)
+    {
+        // Arrange
+        var expiryDate = DateTime.UtcNow.Date.AddDays(daysToExpiry);
+
+        // Act
+        var result = FoodStatusHelper.CalculateStatus(expiryDate);
+
+        // Assert
+        result.Should().Be(FoodStatus.NearExpiry);
+    }
+
+    [Theory]
+    [InlineData(4)]
+    [InlineData(7)]
+    [InlineData(30)]
+    public void CalculateStatus_WhenMoreThanThreeDays_ReturnsFresh(int daysToExpiry)
+    {
+        // Arrange
+        var expiryDate = DateTime.UtcNow.Date.AddDays(daysToExpiry);
+
+        // Act
+        var result = FoodStatusHelper.CalculateStatus(expiryDate);
+
+        // Assert
+        result.Should().Be(FoodStatus.Fresh);
+    }
+
+    [Fact]
+    public void CalculateStatus_WhenExpiredExactlyOneDay_ReturnsExpired()
+    {
+        // Arrange
+        var expiryDate = DateTime.UtcNow.Date.AddDays(-1);
+
+        // Act
+        var result = FoodStatusHelper.CalculateStatus(expiryDate);
+
+        // Assert
+        result.Should().Be(FoodStatus.Expired);
+    }
+
+    [Fact]
+    public void CalculateStatus_WhenExpiresToday_ReturnsNearExpiry()
+    {
+        // Arrange
+        var expiryDate = DateTime.UtcNow.Date;
+
+        // Act
+        var result = FoodStatusHelper.CalculateStatus(expiryDate);
+
+        // Assert
+        result.Should().Be(FoodStatus.NearExpiry);
+    }
+
+    [Fact]
+    public void CalculateStatus_WhenExactlyThreeDaysLeft_ReturnsNearExpiry()
+    {
+        // Arrange
+        var expiryDate = DateTime.UtcNow.Date.AddDays(3);
+
+        // Act
+        var result = FoodStatusHelper.CalculateStatus(expiryDate);
+
+        // Assert
+        result.Should().Be(FoodStatus.NearExpiry);
+    }
+
+    [Fact]
+    public void CalculateStatus_WhenFourDaysLeft_ReturnsFresh()
+    {
+        // Arrange
+        var expiryDate = DateTime.UtcNow.Date.AddDays(4);
+
+        // Act
+        var result = FoodStatusHelper.CalculateStatus(expiryDate);
+
+        // Assert
+        result.Should().Be(FoodStatus.Fresh);
+    }
+
+    [Fact]
+    public void CalculateStatus_IgnoresTimeComponent_UsesDateOnly()
+    {
+        // Arrange：三天后当日的最后一刻仍应处于三天临界点内
+        var expiryDate = DateTime.UtcNow.Date.AddDays(3).AddHours(23).AddMinutes(59);
+
+        // Act
+        var result = FoodStatusHelper.CalculateStatus(expiryDate);
+
+        // Assert
+        result.Should().Be(FoodStatus.NearExpiry);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    public void CalculateStatus_WhenQuantityNotPositive_ReturnsConsumed(decimal quantity)
+    {
+        // Arrange：即使保质期还很新鲜，数量为 0 也应视为已消耗
+        var expiryDate = DateTime.UtcNow.Date.AddDays(30);
+
+        // Act
+        var result = FoodStatusHelper.CalculateStatus(expiryDate, quantity);
+
+        // Assert
+        result.Should().Be(FoodStatus.Consumed);
+    }
+
+    [Theory]
+    [InlineData(-1, FoodStatus.Expired)]
+    [InlineData(0, FoodStatus.NearExpiry)]
+    [InlineData(3, FoodStatus.NearExpiry)]
+    [InlineData(4, FoodStatus.Fresh)]
+    public void CalculateStatus_WithPositiveQuantity_FollowsDateRules(int daysToExpiry, FoodStatus expected)
+    {
+        // Arrange
+        var expiryDate = DateTime.UtcNow.Date.AddDays(daysToExpiry);
+
+        // Act
+        var result = FoodStatusHelper.CalculateStatus(expiryDate, 5m);
+
+        // Assert
+        result.Should().Be(expected);
+    }
+
+    [Theory]
+    [InlineData(-1, 1)]
+    [InlineData(-30, 30)]
+    [InlineData(0, 0)]
+    [InlineData(3, -3)]
+    public void GetDaysExpired_ReturnsDaysSinceExpiry(int daysToExpiry, int expectedDaysExpired)
+    {
+        // Arrange
+        var expiryDate = DateTime.UtcNow.Date.AddDays(daysToExpiry);
+
+        // Act
+        var result = FoodStatusHelper.GetDaysExpired(expiryDate);
+
+        // Assert
+        result.Should().Be(expectedDaysExpired);
+    }
+
+    [Fact]
+    public void ShouldBeArchived_WhenDaysExpiredReachesThreshold_ReturnsTrue()
+    {
+        // Arrange：过期天数刚好等于自动归档阈值
+        var expiryDate = DateTime.UtcNow.Date.AddDays(-7);
+
+        // Act
+        var result = FoodStatusHelper.ShouldBeArchived(expiryDate, FoodStatus.Expired, 7);
+
+        // Assert
+        result.Should().BeTrue();
+    }
+
+    [Fact]
+    public void ShouldBeArchived_WhenDaysExpiredBelowThreshold_ReturnsFalse()
+    {
+        // Arrange：过期天数差一天未达到阈值
+        var expiryDate = DateTime.UtcNow.Date.AddDays(-6);
+
+        // Act
+        var result = FoodStatusHelper.ShouldBeArchived(expiryDate, FoodStatus.Expired, 7);
+
+        // Assert
+        result.Should().BeFalse();
+    }
+
+    [Theory]
+    [InlineData(FoodStatus.Archived)]
+    [InlineData(FoodStatus.Consumed)]
+    public void ShouldBeArchived_WhenAlreadyArchivedOrConsumed_ReturnsFalse(FoodStatus currentStatus)
+    {
+        // Arrange：即使已过期很久，已归档/已消耗的食材不再处理
+        var expiryDate = DateTime.UtcNow.Date.AddDays(-30);
+
+        // Act
+        var result = FoodStatusHelper.ShouldBeArchived(expiryDate, currentStatus, 7);
+
+        // Assert
+        result.Should().BeFalse();
+    }
+}
+
+public class ExpiryAlertSyncServiceTests
+{
+    private readonly Mock<IUnitOfWork> _unitOfWorkMock;
+    private readonly Mock<ILogger<ExpiryAlertSyncService>> _loggerMock;
+    private readonly ExpiryAlertSyncService _syncService;
+    private readonly List<ExpiryAlert> _addedAlerts = new();
+    private readonly List<int> _deletedAlertIds = new();
+
+    public ExpiryAlertSyncServiceTests()
+    {
+        _unitOfWorkMock = new Mock<IUnitOfWork>();
+        _loggerMock = new Mock<ILogger<ExpiryAlertSyncService>>();
+        _syncService = new ExpiryAlertSyncService(_unitOfWorkMock.Object, _loggerMock.Object);
+
+        _unitOfWorkMock.Setup(u => u.FoodItems.UpdateAsync(It.IsAny<FoodItem>()))
+            .Returns(Task.CompletedTask);
+        _unitOfWorkMock.Setup(u => u.ExpiryAlerts.AddAsync(It.IsAny<ExpiryAlert>()))
+            .Callback<ExpiryAlert>(alert => _addedAlerts.Add(alert))
+            .ReturnsAsync((ExpiryAlert alert) => alert);
+        _unitOfWorkMock.Setup(u => u.ExpiryAlerts.DeleteAsync(It.IsAny<int>()))
+            .Callback<int>(id => _deletedAlertIds.Add(id))
+            .Returns(Task.CompletedTask);
+        _unitOfWorkMock.Setup(u => u.SaveChangesAsync()).ReturnsAsync(1);
+    }
+
+    private void SetupHouseholdMembers(params int[] userIds)
+    {
+        var members = userIds
+            .Select(userId => new HouseholdMember { HouseholdId = 1, UserId = userId })
+            .ToList();
+        _unitOfWorkMock.Setup(u => u.HouseholdMembers.FindAsync(It.IsAny<Expression<Func<HouseholdMember, bool>>>()))
+            .ReturnsAsync(members);
+    }
+
+    private void SetupExistingAlerts(params ExpiryAlert[] alerts)
+    {
+        _unitOfWorkMock.Setup(u => u.ExpiryAlerts.FindAsync(It.IsAny<Expression<Func<ExpiryAlert, bool>>>()))
+            .ReturnsAsync(alerts.ToList());
+    }
+
+    private static FoodItem CreateFoodItem(int daysToExpiry, FoodStatus status, decimal quantity = 1m)
+    {
+        return new FoodItem
+        {
+            Id = 1,
+            HouseholdId = 1,
+            Name = "测试食材",
+            ExpiryDate = DateTime.UtcNow.Date.AddDays(daysToExpiry),
+            Quantity = quantity,
+            Status = status
+        };
+    }
+
+    [Fact]
+    public async Task SyncAlertsForFoodItemAsync_WhenExactlyThreeDaysLeft_UpdatesStatusAndCreatesNearExpiryAlerts()
+    {
+        // Arrange：刚好剩三天，处于临期临界点
+        var foodItem = CreateFoodItem(3, FoodStatus.Fresh);
+        SetupHouseholdMembers(10, 11);
+        SetupExistingAlerts();
+
+        // Act
+        await _syncService.SyncAlertsForFoodItemAsync(foodItem);
+
+        // Assert
+        foodItem.Status.Should().Be(FoodStatus.NearExpiry);
+        _unitOfWorkMock.Verify(u => u.FoodItems.UpdateAsync(foodItem), Times.Once);
+        _addedAlerts.Should().HaveCount(2);
+        _addedAlerts.Should().OnlyContain(a => a.AlertType == AlertType.NearExpiry);
+        _addedAlerts.Select(a => a.UserId).Should().BeEquivalentTo(new[] { 10, 11 });
+        _deletedAlertIds.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task SyncAlertsForFoodItemAsync_WhenExpiredExactlyOneDay_UpdatesStatusAndCreatesExpiredAlerts()
+    {
+        // Arrange：刚好过期一天
+        var foodItem = CreateFoodItem(-1, FoodStatus.NearExpiry);
+        SetupHouseholdMembers(10);
+        SetupExistingAlerts();
+
+        // Act
+        await _syncService.SyncAlertsForFoodItemAsync(foodItem);
+
+        // Assert
+        foodItem.Status.Should().Be(FoodStatus.Expired);
+        _addedAlerts.Should().HaveCount(1);
+        _addedAlerts.Should().OnlyContain(a => a.AlertType == AlertType.Expired);
+    }
+
+    [Fact]
+    public async Task SyncAlertsForFoodItemAsync_WhenExpiredExactlyOneDay_RemovesOutdatedNearExpiryAlert()
+    {
+        // Arrange：从临期变为过期后，旧的临期提醒应被移除
+        var foodItem = CreateFoodItem(-1, FoodStatus.NearExpiry);
+        SetupHouseholdMembers(10);
+        SetupExistingAlerts(new ExpiryAlert { Id = 5, FoodItemId = 1, UserId = 10, AlertType = AlertType.NearExpiry });
+
+        // Act
+        await _syncService.SyncAlertsForFoodItemAsync(foodItem);
+
+        // Assert
+        _deletedAlertIds.Should().Contain(5);
+        _addedAlerts.Should().HaveCount(1);
+        _addedAlerts[0].AlertType.Should().Be(AlertType.Expired);
+        _addedAlerts[0].UserId.Should().Be(10);
+    }
+
+    [Fact]
+    public async Task SyncAlertsForFoodItemAsync_WhenExpiresToday_TreatedAsNearExpiry()
+    {
+        // Arrange：今天到期，剩余 0 天，属于临期
+        var foodItem = CreateFoodItem(0, FoodStatus.Fresh);
+        SetupHouseholdMembers(10);
+        SetupExistingAlerts();
+
+        // Act
+        await _syncService.SyncAlertsForFoodItemAsync(foodItem);
+
+        // Assert
+        foodItem.Status.Should().Be(FoodStatus.NearExpiry);
+        _addedAlerts.Should().OnlyContain(a => a.AlertType == AlertType.NearExpiry);
+    }
+
+    [Fact]
+    public async Task SyncAlertsForFoodItemAsync_WhenFourDaysLeft_TreatedAsFreshAndRemovesSystemAlerts()
+    {
+        // Arrange：刚好剩四天，越过三天临界点，属于新鲜
+        var foodItem = CreateFoodItem(4, FoodStatus.NearExpiry);
+        SetupHouseholdMembers(10);
+        SetupExistingAlerts(new ExpiryAlert { Id = 7, FoodItemId = 1, UserId = 10, AlertType = AlertType.NearExpiry });
+
+        // Act
+        await _syncService.SyncAlertsForFoodItemAsync(foodItem);
+
+        // Assert
+        foodItem.Status.Should().Be(FoodStatus.Fresh);
+        _addedAlerts.Should().BeEmpty();
+        _deletedAlertIds.Should().Contain(7);
+    }
+
+    [Fact]
+    public async Task SyncAlertsForFoodItemAsync_WhenStatusAlreadyCorrect_DoesNotUpdateFoodItem()
+    {
+        // Arrange：状态未变化时不应写库
+        var foodItem = CreateFoodItem(3, FoodStatus.NearExpiry);
+        SetupHouseholdMembers(10);
+        SetupExistingAlerts(new ExpiryAlert { Id = 8, FoodItemId = 1, UserId = 10, AlertType = AlertType.NearExpiry });
+
+        // Act
+        await _syncService.SyncAlertsForFoodItemAsync(foodItem);
+
+        // Assert
+        _unitOfWorkMock.Verify(u => u.FoodItems.UpdateAsync(It.IsAny<FoodItem>()), Times.Never);
+        _addedAlerts.Should().BeEmpty();
+        _deletedAlertIds.Should().BeEmpty();
+    }
+
+    [Fact]
+    public async Task SyncAlertsForFoodItemAsync_WhenQuantityZero_UpdatesStatusToConsumed()
+    {
+        // Arrange
+        var foodItem = CreateFoodItem(10, FoodStatus.Fresh, quantity: 0m);
+        SetupHouseholdMembers(10);
+        SetupExistingAlerts();
+
+        // Act
+        await _syncService.SyncAlertsForFoodItemAsync(foodItem);
+
+        // Assert
+        foodItem.Status.Should().Be(FoodStatus.Consumed);
+        _unitOfWorkMock.Verify(u => u.FoodItems.UpdateAsync(foodItem), Times.Once);
+        _addedAlerts.Should().BeEmpty();
+    }
+
+    [Theory]
+    [InlineData(FoodStatus.Consumed)]
+    [InlineData(FoodStatus.Archived)]
+    public async Task SyncAlertsForFoodItemAsync_WhenConsumedOrArchived_RemovesSystemAlertsAndKeepsStatus(FoodStatus status)
+    {
+        // Arrange：已消耗/已归档的食材不重新计算状态，只清理系统提醒
+        var foodItem = CreateFoodItem(3, status);
+        SetupHouseholdMembers(10);
+        SetupExistingAlerts(new ExpiryAlert { Id = 9, FoodItemId = 1, UserId = 10, AlertType = AlertType.NearExpiry });
+
+        // Act
+        await _syncService.SyncAlertsForFoodItemAsync(foodItem);
+
+        // Assert
+        foodItem.Status.Should().Be(status);
+        _deletedAlertIds.Should().Contain(9);
+        _addedAlerts.Should().BeEmpty();
+        _unitOfWorkMock.Verify(u => u.FoodItems.UpdateAsync(It.IsAny<FoodItem>()), Times.Never);
     }
 }
